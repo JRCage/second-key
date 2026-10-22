@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "description": "Pause-and-verify for agents serving older people: scam screen + plain-language action check.",
+  "name": "io.github.JRCage/second-key",
+  "packages": [
+    {
+      "environmentVariables": [
+        {
+          "description": "Optional. Base URL of the hosted Second Key API. When set, calls go to the API; when unset, the server runs the same engine locally, offline.",
+          "isRequired": false,
+          "isSecret": false,
+          "name": "SECOND_KEY_API"
+        }
+      ],
+      "identifier": "second-key-mcp",
+      "registryType": "npm",
+      "transport": {
+        "type": "stdio"
+      },
+      "version": "1.0.0"
+    }
+  ],
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/JRCage/second-key"
+  },
+  "title": "Second Key — pause-and-verify for agents serving older people",
+  "version": "1.0.0"
+}

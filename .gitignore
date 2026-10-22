@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+tests/results.json
+.wrangler/
+local.properties
+*.apk
+.DS_Store

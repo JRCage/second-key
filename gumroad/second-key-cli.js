@@ -1,0 +1,692 @@
+#!/usr/bin/env node
+// Second Key CLI — the pause-and-verify protocol, offline, in one file.
+// No dependencies. Node 18+. Nothing you paste leaves the machine.
+//
+//   node second-key-cli.js screen "the message text"
+//   node second-key-cli.js screen --file message.txt
+//   node second-key-cli.js statement --amount 4000 --recipient "a man named David Cole" \
+//        --method "wire transfer" --new-recipient --irreversible \
+//        --purpose "roof repairs" --name Margaret --contact Ana
+//   node second-key-cli.js statement ... --html   (large-print page instead of JSON)
+//
+// Exit codes: screen → 0 proceed, 1 verify, 2 stop. statement → 0.
+// ==== BEGIN PROTOCOL CORE (same engine as the hosted API) ====
+// Second Key — elder-fraud pattern library (data).
+//
+// Each pattern: id, name (plain), whatItIs (one plain sentence for output),
+// action (the ladder step when this pattern fires on its own: "stop" fires
+// only with a hard signal present; see _engine.js), and signals.
+// Each signal: id, label (plain language, shown to the user), re (RegExp),
+// points, hard (true = this signal alone can push a matched pattern to STOP).
+//
+// Hard signals are the classic loss mechanics: pay by gift card / wire /
+// crypto on demand, secrecy from family, threats of arrest, fees to claim a
+// prize, requests for passwords / codes / account numbers, remote access to
+// the computer, "move the money to a safe account".
+
+const PATTERNS = [
+  {
+    id: "grandparent-bail",
+    name: "Family emergency (grandparent scam)",
+    whatItIs:
+      "Someone claims a grandchild or other family member is in jail, in a hospital, or in trouble, and needs money fast.",
+    signals: [
+      {
+        id: "relative-in-trouble",
+        label: "A family member is said to be in jail, hurt, or in trouble",
+        re: /(grandson|granddaughter|grandchild|my son|my daughter|your son|your daughter|nephew|niece)[\s\S]{0,160}(jail|arrested|bail|hospital|accident|court|trouble|police)/i,
+        points: 4,
+      },
+      {
+        id: "trouble-first-person",
+        label: "The writer says they are in jail or trouble and need help",
+        re: /(i am|i'm|i was) (in jail|arrested|locked up|in the hospital|in trouble)[\s\S]{0,120}(money|bail|help|send)/i,
+        points: 4,
+      },
+      {
+        id: "bail-money",
+        label: "Bail or legal fees are requested",
+        re: /(bail|bond|lawyer|attorney|legal fees?)[\s\S]{0,80}(\$|money|pay|send|cash)/i,
+        points: 3,
+      },
+    ],
+  },
+  {
+    id: "government-threat",
+    name: "Government threat (IRS / Social Security)",
+    whatItIs:
+      "Someone claims to be the IRS, Social Security, or another agency and says you owe money or your benefits will stop.",
+    signals: [
+      {
+        id: "agency-claim",
+        label: "The sender claims to be a government agency",
+        re: /(internal revenue service|\bIRS\b|social security administration|department of the treasury|medicare office|federal agent|homeland security)/i,
+        points: 3,
+      },
+      {
+        id: "arrest-threat",
+        label: "There is a threat of arrest, a warrant, or a lawsuit",
+        re: /(arrest warrant|warrant for your arrest|you will be arrested|legal action|lawsuit against you|police will|taken into custody)/i,
+        points: 3,
+        hard: true,
+      },
+      {
+        id: "benefits-stop",
+        label: "Your benefits or account will be cut off, it says",
+        re: /(benefits? (will be )?(suspended|stopped|cut off|terminated)|social security number (will be )?(suspended|blocked)|account (will be )?(frozen|closed|suspended))/i,
+        points: 3,
+      },
+      {
+        id: "tax-debt",
+        label: "You are told you owe back taxes or a government debt",
+        re: /(owe (back )?taxes|tax debt|unpaid taxes|amount owed to the (irs|government|treasury))/i,
+        points: 2,
+      },
+    ],
+  },
+  {
+    id: "tech-support",
+    name: "Fake tech support",
+    whatItIs:
+      "Someone claims your computer or account has a virus or a problem, and wants you to call a number, pay, or let them connect to your computer.",
+    signals: [
+      {
+        id: "brand-problem",
+        label: "A big company name is used with a virus or security warning",
+        re: /(microsoft|windows|apple|mac|geek squad|norton|mcafee)[\s\S]{0,120}(virus|infected|security (alert|warning|breach)|hacked|suspicious activity|problem detected)/i,
+        points: 3,
+      },
+      {
+        id: "remote-access",
+        label: "They ask to connect to your computer or ask you to install software",
+        re: /(anydesk|teamviewer|remote (access|support|session)|let (me|us) connect|install (this|the) (app|program|software)|share your screen)/i,
+        points: 3,
+        hard: true,
+      },
+      {
+        id: "call-now-warning",
+        label: "A warning tells you to call a number right away",
+        re: /(call (us |now|immediately|right away)|call this number|do not (shut down|turn off|close))/i,
+        points: 1,
+      },
+      {
+        id: "pay-for-fix",
+        label: "You must pay to fix the problem or remove the virus",
+        re: /(pay|charge|fee|subscription)[\s\S]{0,80}(remove|fix|repair|clean|protect)/i,
+        points: 2,
+      },
+    ],
+  },
+  {
+    id: "prize-lottery",
+    name: "Prize or lottery win",
+    whatItIs:
+      "Someone says you won money or a prize, and you must pay a fee, tax, or charge first to get it.",
+    signals: [
+      {
+        id: "you-won",
+        label: "The message says you won a prize, lottery, or sweepstakes",
+        re: /(you (have )?won|winner|lottery|sweepstakes|prize (of|worth)|jackpot|selected to receive)/i,
+        points: 3,
+      },
+      {
+        id: "fee-to-claim",
+        label: "A fee, tax, or charge must be paid before you can claim it",
+        re: /(processing fee|claim fee|pay (a|the) (fee|tax|charge)|fee (of|is) \$|taxes? (must be|to be) paid|shipping (fee|charge))[\s\S]{0,80}(claim|receive|release|deliver)/i,
+        points: 3,
+        hard: true,
+      },
+      {
+        id: "claim-deadline",
+        label: "The prize will be lost if you do not act fast",
+        re: /(claim (it |your prize )?(before|within|by)|expires (in|on|today)|unclaimed)/i,
+        points: 1,
+      },
+    ],
+  },
+  {
+    id: "romance-money",
+    name: "Romance scam",
+    whatItIs:
+      "Someone met online builds a close bond, then asks for money. They often say they are in the military or working far away and cannot meet or video chat.",
+    signals: [
+      {
+        id: "far-away",
+        label: "The person says they are overseas, in the military, or on a rig or ship",
+        re: /(stationed|deployed|overseas|military|army|oil rig|on a ship|working abroad|peacekeeping)/i,
+        points: 2,
+      },
+      {
+        id: "cannot-meet",
+        label: "The person cannot meet or video chat, and gives a reason",
+        re: /(can'?t (video|talk|meet|come home)|not allowed to (call|video)|camera is broken|no (internet|signal) for video)/i,
+        points: 2,
+      },
+      {
+        id: "money-ask-loved-one",
+        label: "A person you know online asks for money, cards, or help with a fee",
+        re: /(send (me )?(some )?money|send (me )?[\s\S]{0,24}gift cards?|buy (me )?[\s\S]{0,16}gift cards?|customs fee|hospital bill|plane ticket|leave (fee|paperwork)|help me (pay|with))/i,
+        points: 3,
+        hard: true,
+      },
+      {
+        id: "love-fast",
+        label: "Strong love is declared fast by someone never met in person",
+        re: /(love of my life|soul ?mate|marry (you|me)|my (dear|love|darling|queen|king))[\s\S]{0,140}(money|send|help|card|fee)/i,
+        points: 2,
+      },
+    ],
+  },
+  {
+    id: "bank-fraud-department",
+    name: "Bank fraud department callback",
+    whatItIs:
+      "A message claims to be your bank's fraud or security team and asks you to call a number, confirm a charge, or move money.",
+    signals: [
+      {
+        id: "fraud-dept-claim",
+        label: "The sender claims to be a bank fraud or security team",
+        re: /(fraud department|fraud team|security department|fraud prevention|bank'?s security)/i,
+        points: 3,
+      },
+      {
+        id: "suspicious-charge",
+        label: "A charge you did not make is named",
+        re: /(charge of \$|suspicious (charge|transaction|activity)|unusual activity|did you (make|authorize) (this|a) (charge|purchase|transaction))/i,
+        points: 2,
+      },
+      {
+        id: "callback-request",
+        label: "You are asked to call a number in the message",
+        re: /(call (us|back|the number)|contact us at|reach (us|our team) at) (at |on )?(\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]?\d{4}/i,
+        points: 1,
+      },
+      {
+        id: "safe-account",
+        label: "You are told to move money to a safe or new account",
+        re: /(move (your )?money|transfer (your )?(money|funds))[\s\S]{0,60}(safe|new|protected) account/i,
+        points: 4,
+        hard: true,
+      },
+      {
+        id: "dont-tell-bank",
+        label: "You are told not to tell the bank staff or anyone at the branch",
+        re: /(do ?n[o']t tell (the )?(bank|branch|teller|staff)|staff (are|is) (involved|suspect)|under investigation (at|inside) the bank)/i,
+        points: 3,
+        hard: true,
+      },
+    ],
+  },
+  {
+    id: "medicare-card",
+    name: "Medicare card or benefits trick",
+    whatItIs:
+      "Someone claims Medicare is sending a new card or that benefits will end, and asks for your Medicare number or other private numbers.",
+    signals: [
+      {
+        id: "medicare-mention",
+        label: "Medicare is named",
+        re: /medicare/i,
+        points: 2,
+      },
+      {
+        id: "new-card",
+        label: "A new card is promised if you confirm your details",
+        re: /(new (medicare )?card|card (is )?(being )?(sent|mailed|issued)|replace your card|plastic card|chip card)/i,
+        points: 2,
+      },
+      {
+        id: "number-ask",
+        label: "Your Medicare number or other private number is requested",
+        re: /(medicare number|social security number|bank account number|confirm your (number|details|information)|verify your (number|identity|information))/i,
+        points: 3,
+        hard: true,
+      },
+      {
+        id: "benefits-expire",
+        label: "Benefits will end or expire soon, it says",
+        re: /(benefits? (will )?(expire|end|stop|be lost)|coverage (will )?(expire|end)|act (now|fast) to keep)/i,
+        points: 2,
+      },
+    ],
+  },
+  {
+    id: "crypto-investment",
+    name: "Guaranteed investment or crypto pitch",
+    whatItIs:
+      "Someone promises high, safe returns on an investment or crypto trade, often a new friend or a wrong-number chat that turns friendly.",
+    signals: [
+      {
+        id: "guaranteed-returns",
+        label: "High returns are promised as safe or guaranteed",
+        re: /(guaranteed (return|profit)|risk[- ]free|double your money|returns? of \d+\s?%|profit every (day|week)|never lose)/i,
+        points: 3,
+      },
+      {
+        id: "crypto-push",
+        label: "Crypto or a trading platform is pushed by a new contact",
+        re: /(crypto|bitcoin|usdt|trading platform|investment group|mentor|signals group)/i,
+        points: 1,
+      },
+      {
+        id: "withdrawal-fee",
+        label: "A fee or tax must be paid to take your money out",
+        re: /(withdrawal fee|pay (a )?(fee|tax) to withdraw|release your (funds|profits)|unlock your account)/i,
+        points: 3,
+        hard: true,
+      },
+    ],
+  },
+];
+
+// Signals that count no matter which pattern they ride on. They are listed
+// on every report where they appear, and some combinations escalate the
+// verdict on their own (see _engine.js).
+const GENERIC_SIGNALS = [
+  {
+    id: "secrecy",
+    label: "You are told to keep this secret or not tell family",
+    re: /(don'?t tell|do not tell|keep (this|it) (a )?secret|between (you and me|us)|no one (else )?(can|must|should) know|don'?t (mention|say) (this|anything) to)/i,
+    points: 2,
+    hard: true,
+  },
+  {
+    id: "gift-cards",
+    label: "Payment by gift card is asked for",
+    re: /gift cards?/i,
+    points: 3,
+    hard: true,
+  },
+  {
+    id: "wire-or-crypto-pay",
+    label: "Payment by wire, crypto, or a cash app is asked for",
+    re: /(wire (the )?(money|funds|\$)|wire transfer|send (it |the money )?(by|via|through) (bitcoin|crypto|zelle|cash ?app|venmo)|buy (bitcoin|crypto)|atm (deposit|machine) (to|for) (send|pay))/i,
+    points: 2,
+    hard: true,
+  },
+  {
+    id: "credential-ask",
+    label: "A password, PIN, sign-in code, or account number is asked for",
+    re: /(your (password|pin|passcode|one[- ]time code|security code|account number)|share (the|your) code|read (me )?(the|back the) code|tell me your (password|pin|code))/i,
+    points: 3,
+    hard: true,
+  },
+  {
+    id: "urgency",
+    label: "Hard time pressure: act now or lose out",
+    re: /(right now|immediately|act now|within (the next )?\d+ (hours?|minutes?)|before it'?s too late|urgent(ly)?|as soon as possible|today only|last chance)/i,
+    points: 1,
+  },
+  {
+    id: "money-ask",
+    label: "Money is asked for",
+    re: /(send (me |us |him |her )?\$\s?\d|send (me |us )?(some )?money|pay \$\s?\d|pay (a |the |now )?\$\s?\d|need \$\s?\d|borrow \$\s?\d)/i,
+    points: 1,
+  },
+];
+
+// Second Key — protocol engine (deterministic, no LLM).
+//
+// Two tools, one ladder: PROCEED / VERIFY / STOP.
+//   screenMessage(text)      — judge an inbound message or request.
+//   buildStatement(input)    — restate a PLANNED action in plain language,
+//                              with the protocol checklist.
+//   readability(text)        — the plain-language rules, enforced in code.
+//
+// The pattern library is data (_patterns.js). The same ids and ladder are
+// mirrored in the Android port (android/.../Protocol.kt) and the CLI.
+
+
+// ---------------------------------------------------------------- screen
+
+function matchSignals(text, signals) {
+  const hits = [];
+  for (const s of signals) {
+    if (s.re.test(text)) hits.push(s);
+  }
+  return hits;
+}
+
+function screenMessage(rawText) {
+  const text = String(rawText || "");
+  const matchedPatterns = [];
+  let anyHard = false;
+
+  for (const p of PATTERNS) {
+    const hits = matchSignals(text, p.signals);
+    const score = hits.reduce((a, s) => a + s.points, 0);
+    if (hits.length && score >= 3) {
+      if (hits.some((s) => s.hard)) anyHard = true;
+      matchedPatterns.push({
+        id: p.id,
+        name: p.name,
+        what_it_is: p.whatItIs,
+        score,
+        signals: hits.map((s) => ({ id: s.id, label: s.label, hard: !!s.hard })),
+      });
+    }
+  }
+  matchedPatterns.sort((a, b) => b.score - a.score);
+
+  const genericHits = matchSignals(text, GENERIC_SIGNALS);
+  const genericScore = genericHits.reduce((a, s) => a + s.points, 0);
+  const hardGenerics = genericHits.filter((s) => s.hard);
+  if (hardGenerics.length) anyHard = true;
+  const moneyAsk = genericHits.some((s) => s.id === "money-ask");
+
+  let verdict;
+  if (
+    (matchedPatterns.length && anyHard) ||
+    hardGenerics.length >= 2 ||
+    (hardGenerics.length >= 1 && moneyAsk)
+  ) {
+    verdict = "stop";
+  } else if (matchedPatterns.length || genericScore >= 3 || hardGenerics.length >= 1) {
+    verdict = "verify";
+  } else {
+    verdict = "proceed";
+  }
+
+  const guidance = {
+    stop: [
+      "Do not send money. Do not share numbers, codes, or passwords.",
+      "End the call or the chat. You do not owe them a reason.",
+      "Check with a person you trust, or call the real office on a number you already have — never a number from the message.",
+    ],
+    verify: [
+      "Do not act on this message yet.",
+      "Check through a channel you chose: the number on your bank card, or a number you saved long ago.",
+      "Never use a number or a link from the message itself.",
+    ],
+    proceed: [
+      "No known trick matched this message.",
+      "Stay normal-careful. If it starts asking for money, gift cards, or codes, check again before you act.",
+    ],
+  }[verdict];
+
+  return {
+    service: "second-key",
+    tool: "screen",
+    verdict,
+    action:
+      verdict === "stop"
+        ? "Stop. Do not comply. Tell your trusted contact."
+        : verdict === "verify"
+          ? "Pause. Verify through an independent channel before you act."
+          : "Proceed with normal care.",
+    matched_patterns: matchedPatterns,
+    generic_signals: genericHits.map((s) => ({ id: s.id, label: s.label, hard: !!s.hard })),
+    guidance,
+    confirmation_script:
+      verdict === "proceed"
+        ? null
+        : "Say this: “Before I send money or share numbers, I always check first. I will hang up and call back on the number I already have. If this is real, it will still be real after I check.”",
+    trusted_contact_draft:
+      verdict === "proceed"
+        ? null
+        : "Hi. My assistant ran a check on a message I got. The check said: " +
+          (verdict === "stop"
+            ? "it matches a known trick, and I should not act on it."
+            : "parts of it need a check before I act.") +
+          " I have not sent any money or shared any numbers. Please call me when you can.",
+  };
+}
+
+// ------------------------------------------------------------ readability
+
+const JARGON = [
+  "utilize", "utilise", "facilitate", "initiate", "transaction", "transmit",
+  "remittance", "beneficiary", "irrevocable", "consequently", "furthermore",
+  "additionally", "approximately", "sufficient", "assistance", "regarding",
+  "prior to", "in order to", "leverage", "implement", "expedite", "forthwith",
+];
+
+const READABILITY_RULES = {
+  max_sentence_words: 16,
+  max_avg_words_per_sentence: 12,
+  max_fk_grade: 6.5,
+};
+
+function countSyllables(word) {
+  const w = word.toLowerCase().replace(/[^a-z]/g, "");
+  if (!w) return 0;
+  if (w.length <= 3) return 1;
+  const groups = w.replace(/e$/, "").match(/[aeiouy]+/g);
+  return Math.max(1, groups ? groups.length : 1);
+}
+
+function readability(text) {
+  const sentences = String(text)
+    .split(/[.!?]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const perSentence = sentences.map((s) => s.split(/\s+/).filter(Boolean));
+  const wordCounts = perSentence.map((w) => w.length);
+  const totalWords = wordCounts.reduce((a, b) => a + b, 0);
+  const totalSyllables = perSentence.flat().reduce((a, w) => a + countSyllables(w), 0);
+  const avg = sentences.length ? totalWords / sentences.length : 0;
+  const longest = wordCounts.length ? Math.max(...wordCounts) : 0;
+  const fk =
+    sentences.length && totalWords
+      ? 0.39 * (totalWords / sentences.length) + 11.8 * (totalSyllables / totalWords) - 15.59
+      : 0;
+  const lower = String(text).toLowerCase();
+  const jargon = JARGON.filter((j) => new RegExp(`\\b${j}\\b`).test(lower));
+  const checks = {
+    longest_sentence_words: longest,
+    longest_ok: longest <= READABILITY_RULES.max_sentence_words,
+    avg_words_per_sentence: Math.round(avg * 10) / 10,
+    avg_ok: avg <= READABILITY_RULES.max_avg_words_per_sentence,
+    fk_grade: Math.round(fk * 10) / 10,
+    fk_ok: fk <= READABILITY_RULES.max_fk_grade,
+    jargon_found: jargon,
+    jargon_ok: jargon.length === 0,
+  };
+  return {
+    sentences: sentences.length,
+    words: totalWords,
+    rules: READABILITY_RULES,
+    ...checks,
+    pass: checks.longest_ok && checks.avg_ok && checks.fk_ok && checks.jargon_ok,
+  };
+}
+
+// ------------------------------------------------------------- statement
+
+const RISKY_METHODS = ["wire", "crypto", "bitcoin", "gift card", "cash", "zelle", "cash app", "venmo"];
+
+function money(n) {
+  return "$" + Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+function buildStatement(input) {
+  const b = input || {};
+  const principal = String(b.principal_name || "").trim();
+  const verb = String(b.verb || "send").trim() || "send";
+  const method = String(b.method || "").trim();
+  const amount = Number(b.amount);
+  const recipient = String(b.recipient || "").trim();
+  const purpose = String(b.purpose || "").trim();
+  const isNew = !!b.is_new_recipient;
+  const reversible = !!b.reversible;
+  const contactName = String(b.trusted_contact_name || "").trim();
+
+  if (!recipient) return { error: "no_recipient", detail: "Send {recipient} — who or what gets the money or the change." };
+  if (!Number.isFinite(amount) || amount <= 0) return { error: "bad_amount", detail: "Send {amount} as a number above zero." };
+
+  // Risk score → cooling-off ladder.
+  let points = 0;
+  const flags = [];
+  if (!reversible) { points += 2; flags.push("This cannot be undone once it is done."); }
+  if (isNew) { points += 2; flags.push("The recipient is new. You have not paid them before."); }
+  if (amount >= 5000) { points += 2; flags.push("The amount is large: " + money(amount) + "."); }
+  else if (amount >= 1000) { points += 1; flags.push("The amount is not small: " + money(amount) + "."); }
+  if (method && RISKY_METHODS.some((m) => method.toLowerCase().includes(m))) {
+    points += 1;
+    flags.push("The way this is paid (" + method + ") is the way trick callers ask for most.");
+  }
+  const risk = points >= 4 ? "high" : points >= 2 ? "elevated" : "standard";
+  const coolHours = risk === "high" ? 48 : risk === "elevated" ? 24 : 1;
+
+  // The plain-language statement. Built from short template sentences;
+  // readability() below grades it, and the tests fail the build if it
+  // breaks the rules.
+  const s = [];
+  s.push(principal ? `${principal}, read this page before any money moves.` : "Read this page before any money moves.");
+  s.push(`You are about to ${verb} ${money(amount)}${method ? " by " + method : ""}.`);
+  s.push(`The money goes to ${recipient}.`);
+  s.push(isNew ? "You have not sent money to this person before." : "You have sent money to this person before.");
+  if (purpose) s.push(`The reason given is ${purpose.replace(/\.+$/, "")}.`);
+  if (!reversible) {
+    s.push(method ? `A ${method} cannot be undone.` : "This payment cannot be undone.");
+    s.push("Once the money is sent, it is gone for good.");
+    s.push("No bank can pull it back.");
+  } else {
+    s.push("This can be undone after it is sent, if you act fast.");
+  }
+  s.push(`Wait ${coolHours === 1 ? "at least one hour" : coolHours + " hours"} before you ${verb} it.`);
+  const statementText = s.join(" ");
+
+  const checklist = [
+    {
+      step: 1,
+      title: "Read it out loud",
+      text: "Read the words above out loud, or ask your agent to read them to you. Slow is good. A trick falls apart when it is said out loud.",
+    },
+    {
+      step: 2,
+      title: "Check on a number you trust",
+      text: "Call the person or the office on a number you saved long ago, or the number on your bank card. Never use a number from the message that asked for the money.",
+      script:
+        "Say this: “Before I send money, I always check first. I will call back on the number I have for you. If this is real, it will still be real after I check.”",
+    },
+    {
+      step: 3,
+      title: "Wait",
+      text:
+        coolHours === 1
+          ? "Wait at least one hour. Do one other thing first. If it still makes sense after, it is your call."
+          : `Wait ${coolHours} hours before you send this. Real bills can wait. Trick callers cannot wait — that is one way to tell them apart.`,
+    },
+    {
+      step: 4,
+      title: "Tell your trusted contact",
+      text: contactName
+        ? `Send ${contactName} the note below, or call them and read this page.`
+        : "Send the note below to the person you trust most with money calls, or call them and read this page.",
+    },
+  ];
+
+  const draft =
+    `Hi${contactName ? " " + contactName.split(" ")[0] : ""}. ` +
+    `${principal || "I"} am about to ${verb} ${money(amount)}${method ? " by " + method : ""} to ${recipient}. ` +
+    (purpose ? `The reason given is ${purpose.replace(/\.+$/, "")}. ` : "") +
+    `The Second Key check says to wait ${coolHours === 1 ? "one hour" : coolHours + " hours"} first. ` +
+    `Nothing has been sent yet. Please call ${principal || "me"} when you can.`;
+
+  const read = readability(statementText);
+
+  return {
+    service: "second-key",
+    tool: "statement",
+    statement: statementText,
+    statement_sentences: s,
+    risk_level: risk,
+    risk_flags: flags,
+    cooling_off_hours: coolHours,
+    checklist,
+    trusted_contact_draft: draft,
+    readability: read,
+    note: "This is a pause-and-verify protocol. It is not legal, medical, or financial advice.",
+  };
+}
+
+function renderStatementHtml(result) {
+  const esc = (t) =>
+    String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const sentences = result.statement_sentences.map((x) => `<p>${esc(x)}</p>`).join("\n");
+  const steps = result.checklist
+    .map(
+      (c) =>
+        `<li><strong>${esc(c.title)}.</strong> ${esc(c.text)}${c.script ? `<br><em>${esc(c.script)}</em>` : ""}</li>`,
+    )
+    .join("\n");
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Second Key — read this first</title>
+<style>
+body{font-family:Georgia,serif;font-size:24px;line-height:1.65;max-width:34em;margin:2em auto;padding:0 1em;color:#111;background:#fff}
+h1{font-size:32px;line-height:1.3}
+li{margin-bottom:.9em}
+.note{font-size:19px;color:#444}
+@media print{body{font-size:22pt}}
+</style></head><body>
+<h1>Read this before any money moves</h1>
+${sentences}
+<h1>Then do these four things</h1>
+<ol>${steps}</ol>
+<h1>A note you can send</h1>
+<p>${esc(result.trusted_contact_draft)}</p>
+<p class="note">${esc(result.note)}</p>
+</body></html>`;
+}
+
+// ==== END PROTOCOL CORE ====
+
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name) { return args.includes("--" + name); }
+function opt(name) {
+  const i = args.indexOf("--" + name);
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+if (cmd === "screen") {
+  let text = args[1] && !args[1].startsWith("--") ? args[1] : "";
+  const file = opt("file");
+  if (file) text = fs.readFileSync(file, "utf8");
+  if (!text.trim()) {
+    console.error('usage: second-key-cli.js screen "text" | screen --file msg.txt');
+    process.exit(64);
+  }
+  const out = screenMessage(text);
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(out.verdict === "stop" ? 2 : out.verdict === "verify" ? 1 : 0);
+}
+
+if (cmd === "statement") {
+  const input = {
+    principal_name: opt("name") || "",
+    verb: opt("verb") || "send",
+    method: opt("method") || "",
+    amount: Number(opt("amount")),
+    recipient: opt("recipient") || "",
+    purpose: opt("purpose") || "",
+    trusted_contact_name: opt("contact") || "",
+    is_new_recipient: flag("new-recipient"),
+    reversible: flag("reversible"),
+  };
+  const out = buildStatement(input);
+  if (out.error) {
+    console.error(JSON.stringify(out, null, 2));
+    process.exit(64);
+  }
+  if (flag("html")) console.log(renderStatementHtml(out));
+  else console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
+
+console.log(`Second Key CLI — a pause-and-verify protocol for agents acting for older people.
+
+Commands:
+  screen "text" | screen --file msg.txt
+      Judge a message: proceed / verify / stop, with the patterns matched.
+      Exit code 0 = proceed, 1 = verify, 2 = stop.
+  statement --amount N --recipient "..." [--method "wire transfer"]
+            [--new-recipient] [--irreversible is default; --reversible to change]
+            [--purpose "..."] [--name FirstName] [--contact FirstName] [--html]
+      Plain-language restatement + checklist + trusted-contact draft.`);
+process.exit(cmd ? 64 : 0);
